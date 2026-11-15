@@ -1,0 +1,11 @@
+{
+  "name": "pilot-60",
+  "loop": false,
+  "phases": [
+    {"name": "probe", "kind": "probe-scoring", "minutes": 15, "think_s": [0.5, 1.2]},
+    {"name": "abba", "kind": "abba", "inner": "play", "minutes": 40, "block_minutes": 10, "seed_order": true,
+     "a": {"label": "fast", "think_s": [0.2, 0.6]},
+     "b": {"label": "slow", "think_s": [8, 10]}},
+    {"name": "early", "kind": "regime", "regime": "end_early", "minutes": 5, "think_s": [0.3, 0.8]}
+  ]
+}
