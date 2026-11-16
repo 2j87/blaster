@@ -59,6 +59,9 @@ class Calibration:
     tray_cell_ratio: float = 0.5  # tray cell pitch / board cell pitch
     finger_offset_cells: list = field(default_factory=lambda: [0.0, -2.0])  # piece centre - finger
     offset_verified: bool = False
+    # Some builds move the dragged piece faster than the finger:
+    # piece centre = start + drag_gain * (finger - start) + finger_offset_cells * cell.
+    drag_gain: float = 1.0
     game_package: Optional[str] = None
     buttons: dict = field(default_factory=dict)  # name -> {"box": frac box, "template": rel path}
     template_dir: str = "templates"
@@ -109,7 +112,9 @@ class Calibration:
         tx = x0 + (c + piece.w / 2.0) * cw
         ty = y0 + (r + piece.h / 2.0) * ch
         dx, dy = self.finger_offset_cells
-        return slot_center, (tx - dx * cw, ty - dy * ch)
+        g = self.drag_gain or 1.0
+        sx, sy = slot_center
+        return slot_center, (sx + (tx - dx * cw - sx) / g, sy + (ty - dy * ch - sy) / g)
 
 
 def crop(img: np.ndarray, box) -> np.ndarray:
@@ -531,6 +536,10 @@ def read_screen(img: np.ndarray, cal: Calibration, reader: Optional[DigitReader]
     br = parse_board(img, cal)
     if br.confidence < min_board_conf:
         return ScreenRead("unknown", br, [], None, 0.0)
+    if br.board == (1 << 64) - 1:
+        # A completely full board cannot exist in live play (lines would clear); uniform
+        # full-screen menus (home, game over) and the "No Space Left" fill read like this.
+        return ScreenRead("unknown", br, [], None, 0.0)
     slots = parse_tray(img, cal)
     score, conf, best = None, 0.0, None
     if reader is not None:
@@ -544,23 +553,31 @@ def _gray_small(img: np.ndarray, box, step: int = 4) -> np.ndarray:
     return crop(img, box)[::step, ::step].astype(np.float32).mean(axis=-1)
 
 
-def frame_diff(a: np.ndarray, b: np.ndarray, cal: Calibration) -> float:
-    """Mean abs grey difference over board + tray + score regions."""
-    tot = 0.0
+def region_diffs(a: np.ndarray, b: np.ndarray, cal: Calibration) -> tuple:
+    """Mean abs grey difference per region: (board, tray, score)."""
+    out = []
     for box in (cal.board, cal.tray, cal.score):
         pa, pb = _gray_small(a, cal.px_box(box, a.shape)), _gray_small(b, cal.px_box(box, b.shape))
-        if pa.shape == pb.shape and pa.size:
-            tot = max(tot, float(np.abs(pa - pb).mean()))
-    return tot
+        out.append(float(np.abs(pa - pb).mean()) if pa.shape == pb.shape and pa.size else 0.0)
+    return tuple(out)
+
+
+def frame_diff(a: np.ndarray, b: np.ndarray, cal: Calibration) -> float:
+    """Mean abs grey difference over board + tray + score regions (max of the three)."""
+    return max(region_diffs(a, b, cal))
 
 
 def wait_settle(capture: Callable, cal: Calibration, timeout: float = 4.0, interval: float = 0.15,
-                eps: float = 1.5, min_stable_s: float = 0.4, clock=None) -> tuple:
+                eps: float = 1.5, min_stable_s: float = 0.4, clock=None, score_eps: Optional[float] = None) -> tuple:
     """Capture until the screen has been unchanged for at least `min_stable_s`
     (banners and count-ups can look static for a couple of frames).
+    score_eps: separate threshold for the score region. The combo diamond behind the
+    score pulses forever (diff up to ~3.5), while a score count-up changes it by >10;
+    None uses `eps` for every region (old behaviour).
     Returns (img, frames, settled). `clock` provides .time() and .sleep()."""
     import time as _t
     clock = clock or _t
+    s_eps = eps if score_eps is None else score_eps
     t0 = clock.time()
     frames = [capture()]
     stable_since = None
@@ -568,7 +585,8 @@ def wait_settle(capture: Callable, cal: Calibration, timeout: float = 4.0, inter
         clock.sleep(interval)
         f = capture()
         frames.append(f)
-        if frame_diff(frames[-2], f, cal) < eps:
+        db, dt, ds = region_diffs(frames[-2], f, cal)
+        if db < eps and dt < eps and ds < s_eps:
             if stable_since is None:
                 stable_since = clock.time() - interval
             if clock.time() - stable_since >= min_stable_s:
@@ -807,6 +825,7 @@ def main(argv=None):
     o = sub.add_parser("set-offset")
     o.add_argument("dx", type=float)
     o.add_argument("dy", type=float)
+    o.add_argument("--gain", type=float, help="piece movement / finger movement (default: keep)")
     a = ap.parse_args(argv)
 
     calp = Path(a.cal)
@@ -860,8 +879,10 @@ def main(argv=None):
             save_image(draw_overlay(img, cal, sr), a.overlay)
     elif a.cmd == "set-offset":
         cal.finger_offset_cells = [a.dx, a.dy]
+        if a.gain is not None:
+            cal.drag_gain = a.gain
         cal.save(calp)
-        print(f"finger offset = {cal.finger_offset_cells} cells")
+        print(f"finger offset = {cal.finger_offset_cells} cells, drag gain = {cal.drag_gain}")
     return 0
 
 

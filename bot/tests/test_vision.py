@@ -151,3 +151,22 @@ def test_drag_points_hit_target(tmp_path):
     start, end = cal.drag_points(p, r, c, (dev.H, dev.W), slots[0].center)
     dev.drag(*start, *end)
     assert dev.game.board == E.place(0, p, r, c)
+
+
+def test_settle_ignores_pulsing_score_glow(tmp_path):
+    dev, cal, _ = _calibrated(tmp_path)
+    base = dev.screencap().astype(np.int16)
+    x0, y0, x1, y1 = cal.px_box(cal.score, base.shape)
+    n = [0]
+
+    def pulsing():  # score region brightens by 3 on every other frame (combo diamond)
+        n[0] += 1
+        img = base.copy()
+        if n[0] % 2:
+            img[y0:y1, x0:x1] += 3
+        return np.clip(img, 0, 255).astype(np.uint8)
+
+    _, _, settled = V.wait_settle(pulsing, cal, timeout=2.0, clock=dev.clock)
+    assert not settled  # old behaviour: never stable
+    _, _, settled = V.wait_settle(pulsing, cal, timeout=2.0, clock=dev.clock, score_eps=6.0)
+    assert settled
