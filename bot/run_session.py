@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import random
 import signal
 import sys
@@ -85,6 +86,12 @@ class Session:
         self.interrupted = None  # pending_move of a drag cut off by a disconnect
         self.game_uncertain = False  # a move of this game may be missing from the log
         self.uncertain_misses = 0
+        # capture: StreamingDevice exposes .stream (scrcpy); plain devices do not
+        self.stream = getattr(device, "stream", None)
+        self.stream_msgs: Optional[queue.Queue] = None  # messages from the stream threads
+        self.stream_start_ok: Optional[bool] = None
+        self.capture_source: Optional[str] = None
+        self.last_stream_stats_t = clock.time()
         if checkpoint:
             self._restore(checkpoint)
 
@@ -102,6 +109,39 @@ class Session:
                 f"el={self.hand_id} moves={self.moves_total}\n{text}\n", encoding="utf-8")
         except OSError:
             pass
+
+    def capture(self, newer_than: Optional[float] = None):
+        """Screenshot from the stream (if any) or screencap. `newer_than` is a
+        time.perf_counter() value: with a stream, wait for a frame decoded after it."""
+        if self.stream is None:
+            return self.dev.screencap()
+        img = self.dev.screencap(newer_than=newer_than)
+        self.drain_stream_msgs()
+        src = self.stream.last_source
+        if src != self.capture_source:
+            if src == "fallback":
+                self.log.event("capture_fallback", "stream unavailable, using screencap", **self.stream.stats())
+            elif self.capture_source == "fallback":
+                self.log.event("capture_stream_restored", "stream frames again", **self.stream.stats())
+            self.capture_source = src
+        return img
+
+    def drain_stream_msgs(self):
+        q = self.stream_msgs
+        while q is not None:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            self.log.event("stream_log", str(msg)[:300])
+
+    def maybe_stream_stats(self, force: bool = False):
+        if self.stream is None:
+            return
+        self.drain_stream_msgs()
+        if force or self.now() - self.last_stream_stats_t >= self.a.stream_stats_s:
+            self.last_stream_stats_t = self.now()
+            self.log.event("stream_stats", self.capture_source or "", moves=self.moves_total, **self.stream.stats())
 
     def _should_stop(self) -> bool:
         if self.stop_requested:
@@ -186,6 +226,11 @@ class Session:
             calibration=asdict(self.cal), phases=[b.to_dict() for b in self.sched.blocks],
             network=self.a.network, profile=self.a.profile, resumed=self.resumed,
             resumed_elapsed_min=self.elapsed_offset_min, bot_version="0.1.0")
+        if self.stream is not None:
+            self.log.event("capture", "stream" if self.stream_start_ok else "stream start failed: screencap fallback",
+                           **self.stream.stats())
+        else:
+            self.log.event("capture", self.a.capture if self.a.device == "adb" else self.a.device)
 
     def teardown(self):
         if self.brightness_orig and self.a.min_brightness is not None:
@@ -198,6 +243,7 @@ class Session:
         if self.game_active and not self.game_end_logged:
             self.log.game("end", self.game_id, final_score=self.score, best_shown=self.best_shown,
                           moves=self.game_moves, reason="session_end")
+        self.maybe_stream_stats(force=True)
         self.log.event("session_end", f"moves={self.moves_total}", elapsed_min=round(self.elapsed_min(), 2),
                        probes=self.probes.state())
         self.maybe_checkpoint(force=True)
@@ -216,6 +262,7 @@ class Session:
                         self.log.phase(**self.block.to_dict(), elapsed_min=round(self.elapsed_min(), 3))
                 try:
                     self.maybe_health()
+                    self.maybe_stream_stats()
                     self.tick()
                     self.consecutive_errors = 0
                 except DeviceError as ex:
@@ -268,6 +315,7 @@ class Session:
             self.log.event("health_error", str(ex))
             return
         self.log.health(battery=bat.to_dict(), capture_ms=getattr(self.dev, "last_capture_ms", None),
+                        capture_source=self.capture_source,
                         reconnects=getattr(self.dev, "reconnects", None), elapsed_min=round(self.elapsed_min(), 2))
         if bat.temperature_c is not None and bat.temperature_c >= self.a.max_temp:
             self.thermal_pause(bat.temperature_c)
@@ -297,7 +345,9 @@ class Session:
 
     # ------------------------------------------------------------------- tick
     def tick(self):
+        t_tick = self.now()
         f = self.dev.focus()
+        t_focus = self.now()
         if not self.is_game_focus(f):
             self.handle_foreign(f)
             return
@@ -306,9 +356,11 @@ class Session:
             self.foreign_since = None
             self.foreign_backs = 0
         t_obs = self.now()
-        img = self.dev.screencap()
+        img = self.capture()
         cap_ms = getattr(self.dev, "last_capture_ms", None)
+        t_cap = self.now()
         sr = vision.read_screen(img, self.cal, self.reader)
+        t_parse = self.now()
         if sr.kind != "game":
             self.handle_nongame(img)
             return
@@ -349,6 +401,7 @@ class Session:
         ctx = {"since_clear": self.since_clear, "fill": engine.fill_fraction(board)}
         obj = experiments.objective_for(self.block, ctx, self.probes)
         plan = self.solver.solve(board, pieces, obj, since_clear=self.since_clear)
+        t_decide = self.now()
         if not plan.steps:
             self.clock.sleep(0.5)
             return
@@ -356,7 +409,10 @@ class Session:
         wait = t_obs + think_target - self.now()
         if wait > 0:
             self.clock.sleep(wait)
-        self.execute(img, sr, plan, obj, t_obs, think_target, cap_ms)
+        timing = {"t_tick": t_tick, "focus_ms": _ms(t_focus - t_tick), "capture_ms": _ms(t_cap - t_obs),
+                  "parse_ms": _ms(t_parse - t_cap), "decide_ms": _ms(t_decide - t_parse),
+                  "think_wait_ms": _ms(self.now() - t_decide)}
+        self.execute(img, sr, plan, obj, t_obs, think_target, cap_ms, timing)
 
     # ------------------------------------------------------------ game flow
     def detect_new_game(self, board: int, sr: vision.ScreenRead):
@@ -451,7 +507,7 @@ class Session:
             self.foreign_backs = 0
             self.log.event("ad_interrupt", f"{f.package}/{f.activity}", raw=f.raw[:200])
             try:
-                self.save_audit(None, "foreign", img=self.dev.screencap())
+                self.save_audit(None, "foreign", img=self.capture())
             except DeviceError:
                 raise
             except Exception:
@@ -502,7 +558,9 @@ class Session:
             self.last_change_t = self.now()
 
     # --------------------------------------------------------------- moves
-    def execute(self, img, sr: vision.ScreenRead, plan, obj: Objective, t_obs: float, think_target: float, cap_ms):
+    def execute(self, img, sr: vision.ScreenRead, plan, obj: Objective, t_obs: float, think_target: float, cap_ms,
+                timing: Optional[dict] = None):
+        timing = dict(timing or {})
         step = plan.steps[0]
         board = sr.board.board
         piece = engine.get_piece(step.piece_id)
@@ -518,16 +576,27 @@ class Session:
                              "_think_target": think_target, "_move_idx": self.move_idx}
         self.dev.drag(start[0], start[1], end[0], end[1], self.a.swipe_ms)
         t_drop = self.now()
-        img2, frames, settled = vision.wait_settle(self.dev.screencap, self.cal, timeout=self.a.settle_timeout,
+        # stream: every settle frame must be decoded after the previous request (the first
+        # one after the drag + encoder latency), so a stalled stream never looks "stable"
+        last_req = [time.perf_counter() + self.a.post_drag_frame_s]
+
+        def settle_capture():
+            im = self.capture(newer_than=last_req[0])
+            last_req[0] = time.perf_counter()
+            return im
+
+        img2, frames, settled = vision.wait_settle(settle_capture, self.cal, timeout=self.a.settle_timeout,
                                                    interval=self.a.settle_interval,
-                                                   min_stable_s=self.a.settle_min_stable, clock=self.clock)
+                                                   min_stable_s=self.a.settle_min_stable, clock=self.clock,
+                                                   score_eps=self.a.settle_score_eps)
         t_settled = self.now()
         sr2 = vision.read_screen(img2, self.cal, self.reader)
+        t_verify0 = self.now()
         predicted = engine.apply_move(board, piece, step.row, step.col)
         if sr2.kind == "game" and sr2.board.board != predicted.board_after and sr2.board.board != board:
             # one re-check: a late banner/animation can still cover the board
             self.clock.sleep(self.a.recheck_s)
-            img_b = self.dev.screencap()
+            img_b = self.capture(newer_than=time.perf_counter())
             sr_b = vision.read_screen(img_b, self.cal, self.reader)
             frames.append(img_b)
             if sr_b.kind == "game":
@@ -535,7 +604,9 @@ class Session:
                                fixed=sr_b.board.board == predicted.board_after)
                 img2, sr2 = img_b, sr_b
         # stable score: two equal confident reads
+        t_score0 = self.now()
         score_after, score_conf = self.read_stable_score(sr2)
+        t_score1 = self.now()
         verified, kind = False, None
         actual_mr = None
         after_board = sr2.board.board if sr2.kind == "game" else None
@@ -572,7 +643,16 @@ class Session:
             box = (0, max(0, int(y0 - 0.5 * side)), img2.shape[1], min(img2.shape[0], int(y1 + 0.5 * side)))
             shot = self.log.save_image(img2, f"moves/{self.hand_id:06d}_{self.move_idx}.jpg", 80, box=box)
         pieces_left = sum(1 for i, s in enumerate(self.hand_slots) if s is not None and i != step.slot)
+        t_tick = timing.pop("t_tick", t_obs)
+        timing.update(drag_ms=_ms(t_drop - t_start), settle_ms=_ms(t_settled - t_drop),
+                      recheck_ms=_ms(t_score0 - t_verify0), score_ms=_ms(t_score1 - t_score0),
+                      post_ms=_ms(self.now() - t_score1), total_ms=_ms(self.now() - t_tick))
+        cap_extra = {}
+        if self.stream is not None:
+            cap_extra = {"capture_source": self.stream.last_source,
+                         "frame_age_ms": round(self.stream.last_frame_age_ms, 1)}
         self.log.move(
+            timing=timing, **cap_extra,
             game_id=self.game_id, hand_id=self.hand_id, move_idx=self.move_idx, slot=step.slot,
             shape_id=piece.id, anchor=list(mr.anchor), intended_anchor=[step.row, step.col],
             board_before=board, board_after=after_board if after_board is not None else predicted.board_after,
@@ -669,7 +749,7 @@ class Session:
         conf = sr2.score_conf
         for _ in range(self.a.score_reads):
             self.clock.sleep(self.a.score_interval)
-            img = self.dev.screencap()
+            img = self.capture(newer_than=time.perf_counter())
             v, c, _ = vision.read_number(img, self.cal, self.reader, "score")
             if v is not None and c >= self.a.min_score_conf and v == last:
                 return v, min(conf, c)
@@ -722,7 +802,7 @@ class Session:
             return
         if img is None:
             try:
-                img = self.dev.screencap()
+                img = self.capture()
             except Exception:
                 return
             sr = vision.read_screen(img, self.cal, self.reader)
@@ -736,6 +816,10 @@ class Session:
         else:
             rec["parsed_kind"] = sr.kind if sr is not None else None
         self.log.audit(**rec)
+
+
+def _ms(dt: float) -> float:
+    return round(dt * 1000, 1)
 
 
 # ----------------------------------------------------------------------------
@@ -772,6 +856,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--serial")
     ap.add_argument("--adb-path")
     ap.add_argument("--drag-method", choices=["swipe", "motionevent", "draganddrop"], default="swipe")
+    ap.add_argument("--capture", choices=["stream", "screencap"], default="stream",
+                    help="adb only: scrcpy video stream (fast, falls back to screencap automatically) or screencap")
+    ap.add_argument("--stream-max-size", type=int, default=0, help="longest stream side, 0 = native")
+    ap.add_argument("--stream-stats-s", type=float, default=60.0, help="log stream statistics every N seconds")
+    ap.add_argument("--post-drag-frame-s", type=float, default=0.05,
+                    help="stream: first frame after a drag must be decoded this long after the drag returned")
+    ap.add_argument("--tag", default=None, help="free-form label stored in the session metadata (e.g. smoke)")
     ap.add_argument("--folder", help="screenshot folder for --device folder")
     ap.add_argument("--calibration", default=str(vision.DEFAULT_CAL))
     ap.add_argument("--logs", default=str(DEFAULT_LOG_DIR))
@@ -794,6 +885,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--settle-timeout", type=float, default=4.0)
     ap.add_argument("--settle-interval", type=float, default=0.15)
     ap.add_argument("--settle-min-stable", type=float, default=0.4)
+    ap.add_argument("--settle-score-eps", type=float, default=6.0,
+                    help="settle threshold for the score region (ignores the pulsing combo diamond, not count-ups)")
     ap.add_argument("--recheck-s", type=float, default=0.8)
     ap.add_argument("--score-reads", type=int, default=3)
     ap.add_argument("--score-interval", type=float, default=0.2)
@@ -843,6 +936,7 @@ def main(argv=None) -> int:
     seed = a.seed if a.seed is not None else random.randrange(1 << 30)
     if checkpoint and "seed" in (checkpoint.get("args") or {}):
         seed = checkpoint["args"]["seed"]
+    stream_msgs = None
     clock = VirtualClock() if (a.device == "fake" and a.fast_clock) else RealClock()
     part = (checkpoint.get("part", 0) + 1) if checkpoint else 0
     logger = SessionLogger(logs, session_id, a.rotate_minutes, clock=clock, part=part,
@@ -865,6 +959,11 @@ def main(argv=None) -> int:
         else:
             from .capture import AdbDevice
             dev = AdbDevice(a.serial, a.adb_path, drag_method=a.drag_method)
+            if a.capture == "stream":
+                from .stream_capture import StreamingDevice
+                stream_msgs = queue.Queue()
+                dev = StreamingDevice(dev, max_size=a.stream_max_size, output_size=dev.wm_size(),
+                                      log=stream_msgs.put)
     if a.phases:
         config = experiments.load_config(a.phases)
     else:
@@ -875,6 +974,7 @@ def main(argv=None) -> int:
     a.seed = seed
     sched = experiments.PhaseScheduler(config, a.minutes, seed)
     sess = Session(dev, cal, a, logger, clock, sched, cal_path, checkpoint)
+    sess.stream_msgs = stream_msgs
 
     def _sig(signum, frame):
         sess.stop_requested = True
@@ -887,8 +987,16 @@ def main(argv=None) -> int:
     except ValueError:
         pass  # not in main thread (tests)
     print(f"session {logger.session} -> {logger.dir}")
-    sess.run()
-    logger.close()
+    try:
+        if sess.stream is not None:
+            sess.stream_start_ok = dev.start()
+            print("capture: stream" if sess.stream_start_ok else
+                  f"capture: stream failed ({sess.stream.error}), using screencap fallback")
+        sess.run()
+    finally:
+        if sess.stream is not None:
+            dev.stop()
+        logger.close()
     print(f"done: {sess.moves_total} moves, {sess.game_id} games. Logs: {logger.dir}")
     return 0
 

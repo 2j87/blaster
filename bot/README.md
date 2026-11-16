@@ -15,7 +15,7 @@ On the phone, USB debugging must be on and Auto Blocker off. If `adb` is not on 
 
 ```powershell
 python -m bot.capture info
-python -m bot.capture packages --pattern blast
+python -m bot.capture packages --pattern juggle   # Block Blast is com.block.juggle
 python -m bot.capture grab cal_empty.png
 python -m bot.vision calibrate cal_empty.png --score-value 0 --package <package_name> --overlay cal_overlay.png
 python -m bot.vision label-score shot_1234.png 1234
@@ -33,6 +33,10 @@ Repeat `label-score` until all digits 0-9 have been learned. Only the decline an
 python -m bot.run_session --minutes 60 --phases bot\phases\pilot.json --min-brightness 10 --network online --profile real
 python -m bot.run_session --minutes 600 --phases bot\phases\overnight.json --min-brightness 10 --network online --profile real
 ```
+
+Capture: `--capture stream` (default) reads frames from a scrcpy video stream (needs `E:\tools\scrcpy\scrcpy-server` 5.0.1 and PyAV). If the stream fails or stalls, the bot switches to `adb exec-out screencap -p` by itself and logs a `capture_fallback` event. `--capture screencap` forces the slow path. Each move record has a `timing` breakdown (focus, capture, parse, decide, drag, settle, score).
+
+Use `--logs <dir> --tag smoke` for test runs so they never mix with pilot logs.
 
 Dry run without a phone: `python -m bot.run_session --device fake --fast-clock --minutes 30 --mode mixed --speed abba`
 

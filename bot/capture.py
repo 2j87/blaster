@@ -130,6 +130,7 @@ class AdbDevice:
         self._d = None
         self.use_adbutils = use_adbutils
         self.last_capture_ms = 0.0
+        self.capture_path: Optional[str] = None
         self.reconnects = 0
         self._connect()
 
@@ -211,21 +212,32 @@ class AdbDevice:
         return self._adb(["shell", cmd], timeout=timeout).decode(errors="replace")
 
     def screencap(self) -> np.ndarray:
+        """Full-resolution RGB screenshot.
+
+        Fastest path first: `adb exec-out screencap -p` (PNG, ~0.25 MB over USB, ~0.8 s on
+        the SM-A245F) instead of the raw 10 MB dump through the adbutils shell (~3.2 s).
+        The raw paths remain as fallbacks."""
         t0 = time.perf_counter()
         img = None
-        if self._d is not None:
+        errors = []
+        for name, fn in (("exec-out-png", lambda: self._adb(["exec-out", "screencap", "-p"])),
+                         ("exec-out-raw", lambda: self._adb(["exec-out", "screencap"])),
+                         ("adbutils-raw", self._adbutils_screencap)):
             try:
-                data = self._d.shell("screencap", encoding=None, timeout=self.timeout, rstrip=False)
-                img = decode_screencap(data)
-            except Exception:
-                img = None
+                img = decode_screencap(fn())
+                self.capture_path = name
+                break
+            except Exception as ex:
+                errors.append(f"{name}: {ex}")
         if img is None:
-            try:
-                img = decode_screencap(self._adb(["exec-out", "screencap"]))
-            except DeviceError:
-                img = decode_screencap(self._adb(["exec-out", "screencap", "-p"]))
+            raise DeviceError("screencap failed: " + "; ".join(errors))
         self.last_capture_ms = (time.perf_counter() - t0) * 1000
         return img
+
+    def _adbutils_screencap(self) -> bytes:
+        if self._d is None:
+            raise DeviceError("adbutils not available")
+        return self._d.shell("screencap", encoding=None, timeout=self.timeout, rstrip=False)
 
     # -- input --------------------------------------------------------------
     def drag(self, x1: float, y1: float, x2: float, y2: float, duration_ms: int = 300):
@@ -413,7 +425,7 @@ def main(argv=None) -> int:
     sub.add_parser("focus")
     sub.add_parser("battery")
     p = sub.add_parser("packages")
-    p.add_argument("--pattern", default="blast")
+    p.add_argument("--pattern", default="juggle", help="substring of the package name (Block Blast: com.block.juggle)")
     t = sub.add_parser("time", help="measure the time of 10 screenshots")
     t.add_argument("--n", type=int, default=10)
     a = ap.parse_args(argv)

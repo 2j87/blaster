@@ -137,3 +137,59 @@ def test_folder_device_parse_only(tmp_path):
                              "--save-images", "none"]) == 0
     recs = read_jsonl(tmp_path / "f")
     assert any(r["type"] == "hand" for r in recs)
+
+
+class _FakeStream:
+    """Mimics StreamCapture's reporting surface."""
+
+    def __init__(self):
+        self.last_source = "stream"
+        self.last_frame_age_ms = 5.0
+        self.calls = []
+
+    def stats(self):
+        return {"running": self.last_source == "stream", "frames": len(self.calls), "fallbacks": 0}
+
+
+class _StreamWrapped:
+    """FakeDevice behind a StreamingDevice-like wrapper; frames 6-9 come from the fallback."""
+
+    def __init__(self, dev):
+        self._dev = dev
+        self.stream = _FakeStream()
+
+    def screencap(self, newer_than=None):
+        self.stream.calls.append(newer_than)
+        n = len(self.stream.calls)
+        self.stream.last_source = "fallback" if 6 <= n < 10 else "stream"
+        return self._dev.screencap()
+
+    def __getattr__(self, name):
+        return getattr(self._dev, name)
+
+
+def test_stream_capture_events_and_timing(tmp_path):
+    clock = VirtualClock()
+    dev = FakeDevice(seed=5, clock=clock)
+    cal = run_session.setup_fake_calibration(dev, tmp_path)
+    a = run_session.build_parser().parse_args(["--minutes", "2", "--save-images", "none", "--logs", str(tmp_path),
+                                               "--stream-stats-s", "30"])
+    a.stop_file = None
+    logger = SessionLogger(tmp_path, "s", 60, clock=clock, fsync=False)
+    sched = experiments.PhaseScheduler(experiments.preset_config("play", "fast", 10, 2), 2, 1)
+    wrapped = _StreamWrapped(dev)
+    sess = run_session.Session(wrapped, cal, a, logger, clock, sched)
+    sess.stream_start_ok = True
+    sess.run()
+    logger.close()
+    recs = read_jsonl(tmp_path / "s")
+    ev = [r["kind"] for r in recs if r["type"] == "event"]
+    assert "capture" in ev and "capture_fallback" in ev and "capture_stream_restored" in ev
+    assert "stream_stats" in ev
+    moves = [r for r in recs if r["type"] == "move"]
+    assert moves and all(m["capture_source"] in ("stream", "fallback") for m in moves)
+    t = moves[-1]["timing"]
+    for k in ("focus_ms", "capture_ms", "parse_ms", "decide_ms", "drag_ms", "settle_ms", "score_ms", "total_ms"):
+        assert k in t
+    # settle frames after a drag always ask for a frame newer than the drag
+    assert any(c is not None for c in wrapped.stream.calls)
